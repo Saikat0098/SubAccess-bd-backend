@@ -383,6 +383,17 @@ router.get('/sync-session/:sessionId', protect, async (req: AuthRequest, res: Re
   }
 });
 
+// @route GET /api/fastpay/webhook-health (Health probe endpoint for Fast Pay webhook router)
+router.get('/webhook-health', (_req: Request, res: Response) => {
+  return res.json({
+    success: true,
+    service: 'SubAccess BD',
+    webhook: 'FastPay',
+    status: 'alive',
+    endpoint: '/api/fastpay/webhook',
+  });
+});
+
 // @route POST /api/fastpay/webhook (Public server-to-server Fast Pay HMAC signed webhook endpoint)
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
