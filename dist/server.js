@@ -3590,9 +3590,20 @@ router12.get("/sync-session/:sessionId", protect, async (req, res) => {
     return res.status(500).json({ success: false, message: error.message || "Session sync error" });
   }
 });
+router12.get("/webhook-health", (_req, res) => {
+  return res.json({
+    success: true,
+    service: "SubAccess BD",
+    webhook: "FastPay",
+    status: "alive",
+    endpoint: "/api/fastpay/webhook",
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  });
+});
 router12.post("/webhook", async (req, res) => {
   try {
     const signatureHeader = req.headers["x-fastpay-signature"] || req.headers["x-signature"];
+    console.log(`[FastPay Webhook] Incoming request: POST ${req.originalUrl || "/api/fastpay/webhook"} | Signature present: ${Boolean(signatureHeader)}`);
     if (!signatureHeader) {
       return res.status(401).json({ success: false, message: "Missing webhook signature header" });
     }
@@ -3604,6 +3615,7 @@ router12.post("/webhook", async (req, res) => {
     const rawBodyBuffer = req.rawBody || req.body;
     const isValid = fastpay_default.verifyWebhookSignature(rawBodyBuffer, signatureHeader, secret);
     if (!isValid) {
+      console.warn("[FastPay Webhook] Invalid or expired HMAC signature rejected");
       return res.status(401).json({ success: false, message: "Invalid or expired webhook signature" });
     }
     let payload;
@@ -3793,6 +3805,7 @@ async function startServer() {
     }
   }
   app.use("/api/fastpay", fastpay_routes_default);
+  console.log("\u{1F680} [FastPay] Webhook route registered: POST /api/fastpay/webhook");
   app.use("/api/auth", authRoutes_default);
   app.use("/api/products", productRoutes_default);
   app.use("/api/categories", categoryRoutes_default);

@@ -383,10 +383,24 @@ router.get('/sync-session/:sessionId', protect, async (req: AuthRequest, res: Re
   }
 });
 
+// @route GET /api/fastpay/webhook-health (Diagnostic health check for Fast Pay webhook router)
+router.get('/webhook-health', (_req: Request, res: Response) => {
+  return res.json({
+    success: true,
+    service: 'SubAccess BD',
+    webhook: 'FastPay',
+    status: 'alive',
+    endpoint: '/api/fastpay/webhook',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // @route POST /api/fastpay/webhook (Public server-to-server Fast Pay HMAC signed webhook endpoint)
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
     const signatureHeader = (req.headers['x-fastpay-signature'] || req.headers['x-signature']) as string | undefined;
+    console.log(`[FastPay Webhook] Incoming request: POST ${req.originalUrl || '/api/fastpay/webhook'} | Signature present: ${Boolean(signatureHeader)}`);
+    
     if (!signatureHeader) {
       return res.status(401).json({ success: false, message: 'Missing webhook signature header' });
     }
@@ -401,6 +415,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
     const rawBodyBuffer = (req as any).rawBody || req.body;
     const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, secret);
     if (!isValid) {
+      console.warn('[FastPay Webhook] Invalid or expired HMAC signature rejected');
       return res.status(401).json({ success: false, message: 'Invalid or expired webhook signature' });
     }
 
