@@ -85,7 +85,6 @@ async function startServer() {
   }
 
   app.use('/api/fastpay', fastPayRoutes);
-  console.log('🚀 [FastPay] Webhook route registered: POST /api/fastpay/webhook');
 
   // Register API Routes
   app.use('/api/auth', authRoutes);
