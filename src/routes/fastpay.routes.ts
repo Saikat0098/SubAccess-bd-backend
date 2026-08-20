@@ -401,20 +401,30 @@ router.get('/webhook-health', (_req: Request, res: Response) => {
 // @route POST /api/fastpay/webhook (Public server-to-server Fast Pay HMAC signed webhook endpoint)
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
-    const signatureHeader = (req.headers['x-fastpay-signature'] || req.headers['x-signature']) as string | undefined;
+    const signatureHeader = (
+      req.headers['x-fastpay-signature'] ||
+      req.headers['x-signature'] ||
+      req.headers['x-webhook-signature'] ||
+      req.headers['webhook-signature']
+    ) as string | undefined;
+
     if (!signatureHeader) {
       return res.status(401).json({ success: false, message: 'Missing webhook signature header' });
     }
 
-    const secret = process.env.FASTPAY_WEBHOOK_SECRET || '';
-    if (!secret) {
+    const secrets = [
+      process.env.FASTPAY_BRAND_WEBHOOK_SECRET,
+      process.env.FASTPAY_WEBHOOK_SECRET,
+    ].filter(Boolean) as string[];
+
+    if (secrets.length === 0) {
       console.error('FASTPAY_WEBHOOK_SECRET is not configured on backend');
       return res.status(500).json({ success: false, message: 'Server webhook configuration error' });
     }
 
     // Verify HMAC signature using raw request body Buffer
     const rawBodyBuffer = (req as any).rawBody || req.body;
-    const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, secret);
+    const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, secrets);
     if (!isValid) {
       return res.status(401).json({ success: false, message: 'Invalid or expired webhook signature' });
     }
