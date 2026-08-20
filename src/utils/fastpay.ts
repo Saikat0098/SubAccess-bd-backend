@@ -3,6 +3,7 @@ import crypto from 'crypto';
 export interface FastPayConfig {
   apiKey?: string;
   merchantId?: string;
+  brandId?: string;
   baseUrl?: string;
   webhookSecret?: string;
   timeout?: number;
@@ -16,6 +17,7 @@ export interface CreateCheckoutParams {
   cancelUrl?: string;
   customerName?: string;
   customerPhone?: string;
+  brandId?: string;
 }
 
 export interface CreateCheckoutResult {
@@ -26,6 +28,7 @@ export interface CreateCheckoutResult {
   amount: number;
   currency: string;
   status: string;
+  brandId?: string;
   expiresAt?: string;
 }
 
@@ -57,6 +60,7 @@ export interface PaymentStatusResult {
   currency: string;
   transactionId?: string;
   provider?: string;
+  brandId?: string;
   expiresAt?: string;
   raw?: any;
 }
@@ -69,6 +73,7 @@ export interface FastPayApiError extends Error {
 export class FastPay {
   public apiKey: string;
   public merchantId: string;
+  public brandId: string;
   public baseUrl: string;
   public webhookSecret: string;
   public timeout: number;
@@ -76,12 +81,12 @@ export class FastPay {
   constructor(config: FastPayConfig = {}) {
     this.apiKey = config.apiKey || (typeof process !== 'undefined' ? process.env.FASTPAY_API_KEY : '') || '';
     this.merchantId = config.merchantId || (typeof process !== 'undefined' ? process.env.FASTPAY_MERCHANT_ID : '') || '';
+    this.brandId = config.brandId || (typeof process !== 'undefined' ? process.env.FASTPAY_BRAND_ID : '') || '';
     const rawBaseUrl = config.baseUrl || (typeof process !== 'undefined' ? process.env.FASTPAY_API_URL : '') || '';
     this.webhookSecret = config.webhookSecret || (typeof process !== 'undefined' ? process.env.FASTPAY_WEBHOOK_SECRET : '') || '';
     this.timeout = config.timeout || 10000;
 
     if (!this.apiKey) throw new Error('FastPay SDK Error: API key is required.');
-    if (!this.merchantId) throw new Error('FastPay SDK Error: Merchant ID is required.');
     if (!rawBaseUrl) throw new Error('FastPay SDK Error: API base URL is required.');
 
     this.baseUrl = rawBaseUrl.trim().replace(/\/+$/, '');
@@ -89,13 +94,18 @@ export class FastPay {
 
   public async _request(endpoint: string, method: string = 'GET', data: any = null): Promise<any> {
     const url = `${this.baseUrl}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-API-Key': this.apiKey,
+      'Authorization': `Bearer ${this.apiKey}`,
+    };
+    if (this.brandId) {
+      headers['X-Brand-Id'] = this.brandId;
+    }
+
     const response = await fetch(url, {
       method,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': this.apiKey,
-        'Authorization': `Bearer ${this.apiKey}`,
-      },
+      headers,
       body: data ? JSON.stringify(data) : undefined,
     });
     const resText = await response.text();
@@ -120,7 +130,7 @@ export class FastPay {
     if (!params.amount || Number(params.amount) <= 0) throw new Error('FastPay SDK Error: valid positive amount is required.');
     if (!params.returnUrl || !/^https?:\/\//i.test(params.returnUrl)) throw new Error('FastPay SDK Error: valid returnUrl (HTTP/HTTPS) is required.');
 
-    const res = await this._request('/checkout/sessions', 'POST', {
+    const payload: Record<string, any> = {
       orderId: String(params.orderId).trim(),
       amount: Number(params.amount),
       currency: (params.currency || 'BDT').toUpperCase(),
@@ -128,7 +138,15 @@ export class FastPay {
       cancelUrl: params.cancelUrl ? params.cancelUrl.trim() : '',
       customerName: params.customerName || '',
       customerPhone: params.customerPhone || '',
-    });
+    };
+    if (params.brandId || this.brandId) {
+      payload.brandId = params.brandId || this.brandId;
+    }
+    if (this.merchantId) {
+      payload.merchantId = this.merchantId;
+    }
+
+    const res = await this._request('/checkout/sessions', 'POST', payload);
     return {
       success: true,
       sessionId: res.sessionId,
@@ -137,6 +155,7 @@ export class FastPay {
       amount: res.amount,
       currency: res.currency,
       status: res.status,
+      brandId: res.brandId || payload.brandId,
       expiresAt: res.expiresAt,
     };
   }
