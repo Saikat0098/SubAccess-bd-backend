@@ -52,7 +52,7 @@ async function startServer() {
     origin: process.env.FRONTEND_URL || 'http://localhost:5174',
     credentials: true,
   }));
-  // Parse JSON with rawBody buffer capture for HMAC webhook signature verification
+  // Capture rawBody Buffer for HMAC webhook signature verification across all payload types
   app.use(
     express.json({
       limit: '10mb',
@@ -61,7 +61,24 @@ async function startServer() {
       },
     })
   );
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  app.use(
+    express.urlencoded({
+      extended: true,
+      limit: '10mb',
+      verify: (req: any, _res, buf) => {
+        if (!req.rawBody) req.rawBody = buf;
+      },
+    })
+  );
+  app.use(
+    express.text({
+      type: ['text/*', 'application/jwt', 'application/octet-stream'],
+      limit: '10mb',
+      verify: (req: any, _res, buf) => {
+        if (!req.rawBody) req.rawBody = buf;
+      },
+    })
+  );
 
   // Rate Limiter
   const apiLimiter = rateLimit({

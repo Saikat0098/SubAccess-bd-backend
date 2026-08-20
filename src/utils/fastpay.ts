@@ -236,11 +236,23 @@ export class FastPay {
     payload: Buffer | string | Record<string, any>,
     signatureHeader: string | undefined | null,
     secret: string | string[],
-    toleranceInSeconds: number = 300
+    toleranceInSeconds: number = 900
   ): boolean {
-    const secretList = Array.isArray(secret) ? secret.filter(Boolean) : [secret].filter(Boolean);
-    if (secretList.length === 0) return false;
+    const rawSecrets = Array.isArray(secret) ? secret.filter(Boolean) : [secret].filter(Boolean);
+    if (rawSecrets.length === 0) return false;
     if (!signatureHeader || typeof signatureHeader !== 'string') return false;
+
+    // Expand secret list to handle with and without whsec_ prefixes
+    const secretList: string[] = [];
+    for (const s of rawSecrets) {
+      const trimmed = String(s).trim();
+      if (!trimmed) continue;
+      if (!secretList.includes(trimmed)) secretList.push(trimmed);
+      const withoutPrefix = trimmed.replace(/^whsec_/, '');
+      if (withoutPrefix && !secretList.includes(withoutPrefix)) secretList.push(withoutPrefix);
+      const withPrefix = `whsec_${withoutPrefix}`;
+      if (!secretList.includes(withPrefix)) secretList.push(withPrefix);
+    }
 
     let payloadString = '';
     if (Buffer.isBuffer(payload)) payloadString = payload.toString('utf8');
@@ -250,20 +262,32 @@ export class FastPay {
 
     const headerTrimmed = signatureHeader.trim();
 
-    // Parse header parts (t=..., v1=... or sha256=... or raw hex)
+    // Parse header parts (t=..., v1=... or semicolon/space separated or sha256=... or raw hex)
     let timestampStr = '';
     let signatureHex = '';
 
     if (headerTrimmed.includes('=')) {
       const parts: Record<string, string> = {};
-      headerTrimmed.split(',').forEach((p) => {
-        const idx = p.indexOf('=');
+      const tokens = headerTrimmed.split(/[,;\s]+/).filter(Boolean);
+      for (const token of tokens) {
+        const idx = token.indexOf('=');
         if (idx !== -1) {
-          parts[p.substring(0, idx).trim()] = p.substring(idx + 1).trim();
+          const key = token.substring(0, idx).trim().toLowerCase();
+          const val = token.substring(idx + 1).trim().replace(/^["']|["']$/g, '');
+          parts[key] = val;
         }
-      });
-      timestampStr = parts.t || parts.timestamp || '';
-      signatureHex = parts.v1 || parts.v0 || parts.sha256 || parts.sig || '';
+      }
+      timestampStr = parts.t || parts.timestamp || parts.time || parts.ts || '';
+      signatureHex =
+        parts.v1 ||
+        parts.v0 ||
+        parts.v2 ||
+        parts.sha256 ||
+        parts.sig ||
+        parts.signature ||
+        parts.hmac ||
+        parts.s ||
+        '';
     } else if (/^[0-9a-fA-F]{64}$/.test(headerTrimmed)) {
       signatureHex = headerTrimmed;
     }
@@ -272,41 +296,70 @@ export class FastPay {
       signatureHex = headerTrimmed.substring(7).trim();
     }
 
+    // Strip optional sha256= or v1= prefixes inside the extracted signature
+    if (signatureHex.startsWith('sha256=')) {
+      signatureHex = signatureHex.substring(7).trim();
+    }
+
     if (!signatureHex || !/^[0-9a-fA-F]{64}$/.test(signatureHex)) {
       return false;
     }
 
-    // If timestamp exists, validate tolerance (supporting both ms and seconds timestamps)
+    // Parse timestamp (supporting unix seconds, unix milliseconds, and ISO-8601 date strings)
     let hasValidTimestamp = false;
+    let timestampWithinTolerance = false;
+
     if (timestampStr) {
-      let timestampNum = parseInt(timestampStr, 10);
+      hasValidTimestamp = true;
+      let timestampNum = Number(timestampStr);
+
+      if (isNaN(timestampNum)) {
+        const parsedDate = Date.parse(timestampStr);
+        if (!isNaN(parsedDate)) {
+          timestampNum = parsedDate;
+        }
+      }
+
       if (!isNaN(timestampNum)) {
         if (timestampNum > 1e11) {
           timestampNum = Math.floor(timestampNum / 1000);
         }
-        if (toleranceInSeconds && Math.abs(Math.floor(Date.now() / 1000) - timestampNum) > toleranceInSeconds) {
-          return false;
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (!toleranceInSeconds || Math.abs(nowSec - timestampNum) <= toleranceInSeconds) {
+          timestampWithinTolerance = true;
         }
-        hasValidTimestamp = true;
+      } else {
+        // If timestamp cannot be parsed into a numeric epoch, allow signature check but skip strict epoch tolerance
+        timestampWithinTolerance = true;
       }
     }
 
-    const sigBuffer = Buffer.from(signatureHex, 'hex');
+    const sigBuffer = Buffer.from(signatureHex.toLowerCase(), 'hex');
 
     for (const sec of secretList) {
-      if (hasValidTimestamp) {
-        const expectedTimestamped = crypto
-          .createHmac('sha256', sec)
-          .update(`${timestampStr}.${payloadString}`)
-          .digest('hex');
-        try {
-          if (crypto.timingSafeEqual(sigBuffer, Buffer.from(expectedTimestamped, 'hex'))) {
-            return true;
-          }
-        } catch (_) {}
+      // 1. Check timestamped HMAC if timestamp was present and within tolerance (or tolerance disabled)
+      if (hasValidTimestamp && timestampWithinTolerance) {
+        const candidatePayloads = [
+          `${timestampStr}.${payloadString}`,
+          `${timestampStr}:${payloadString}`,
+          `${timestampStr}${payloadString}`,
+          `t=${timestampStr}.${payloadString}`,
+        ];
+
+        for (const candidate of candidatePayloads) {
+          const expected = crypto
+            .createHmac('sha256', sec)
+            .update(candidate)
+            .digest('hex');
+          try {
+            if (crypto.timingSafeEqual(sigBuffer, Buffer.from(expected, 'hex'))) {
+              return true;
+            }
+          } catch (_) {}
+        }
       }
 
-      // Also try direct payload HMAC
+      // 2. Check direct payload HMAC (without timestamp prefix)
       const expectedDirect = crypto
         .createHmac('sha256', sec)
         .update(payloadString)

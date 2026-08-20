@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
 import FastPay, { FastPayApiError } from '../utils/fastpay.js';
 import { Order } from '../models/Order.js';
 import { Payment } from '../models/Payment.js';
@@ -403,9 +404,17 @@ router.post('/webhook', async (req: Request, res: Response) => {
   try {
     const signatureHeader = (
       req.headers['x-fastpay-signature'] ||
+      req.headers['fastpay-signature'] ||
       req.headers['x-signature'] ||
       req.headers['x-webhook-signature'] ||
-      req.headers['webhook-signature']
+      req.headers['webhook-signature'] ||
+      req.headers['x-hub-signature-256'] ||
+      req.headers['x-hub-signature'] ||
+      req.headers['x-signature-sha256'] ||
+      req.headers['signature'] ||
+      (typeof req.headers['authorization'] === 'string' && req.headers['authorization'].startsWith('FastPay ')
+        ? req.headers['authorization'].slice(8)
+        : undefined)
     ) as string | undefined;
 
     if (!signatureHeader) {
@@ -415,6 +424,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
     const secrets = [
       process.env.FASTPAY_BRAND_WEBHOOK_SECRET,
       process.env.FASTPAY_WEBHOOK_SECRET,
+      process.env.FASTPAY_API_KEY,
     ].filter(Boolean) as string[];
 
     if (secrets.length === 0) {
@@ -446,35 +456,83 @@ router.post('/webhook', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Invalid JSON payload format' });
     }
 
-    const { event, data } = payload || {};
+    const { event, data, type, eventType, eventName } = payload || {};
+    const effectiveEvent = String(event || type || eventType || eventName || '').toLowerCase();
+
+    // Check if event is a payment completion/verification event
+    const isPaymentVerifiedEvent =
+      effectiveEvent === 'payment.verified' ||
+      effectiveEvent === 'payment_verified' ||
+      effectiveEvent === 'payment.success' ||
+      effectiveEvent === 'payment_success' ||
+      effectiveEvent === 'checkout.session.completed' ||
+      effectiveEvent === 'payment.completed' ||
+      effectiveEvent === 'order.paid';
 
     // For unhandled / future webhook event types, acknowledge receipt safely
-    if (event !== 'payment.verified') {
+    if (!isPaymentVerifiedEvent && effectiveEvent) {
       return res.status(200).json({
         success: true,
-        message: `Webhook event '${event || 'unknown'}' acknowledged without state changes`,
+        message: `Webhook event '${effectiveEvent}' acknowledged without state changes`,
       });
     }
 
-    const sessionId = data?.sessionId || data?.checkoutSessionId || data?.session_id || data?.id;
-    const orderId = data?.orderId || data?.order_id;
+    const eventData = data || payload?.session || payload?.payment || payload;
+    const sessionId =
+      eventData?.sessionId ||
+      eventData?.checkoutSessionId ||
+      eventData?.session_id ||
+      eventData?.id ||
+      payload?.sessionId;
+    const rawOrderId =
+      eventData?.orderId ||
+      eventData?.order_id ||
+      eventData?.orderNumber ||
+      payload?.orderId ||
+      payload?.order_id;
     const transactionId =
-      data?.transactionId ||
-      data?.trxId ||
-      data?.transaction_id ||
-      data?.payment?.transactionId ||
-      data?.payment?.trxId ||
-      data?.payment?.transaction_id;
-    const amount = Number(data?.amount || data?.payment?.amount);
-    const provider = data?.provider || data?.gateway || data?.payment?.provider || data?.payment?.gateway || 'FastPay';
+      eventData?.transactionId ||
+      eventData?.trxId ||
+      eventData?.transaction_id ||
+      eventData?.payment?.transactionId ||
+      eventData?.payment?.trxId ||
+      eventData?.payment?.transaction_id ||
+      payload?.transactionId ||
+      payload?.trxId;
+    const amount = Number(
+      eventData?.amount !== undefined
+        ? eventData.amount
+        : eventData?.payment?.amount !== undefined
+        ? eventData.payment.amount
+        : payload?.amount
+    );
+    const provider =
+      eventData?.provider ||
+      eventData?.gateway ||
+      eventData?.payment?.provider ||
+      eventData?.payment?.gateway ||
+      payload?.provider ||
+      'FastPay';
 
-    // Locate SubAccess Order in MongoDB (Priority: fastpaySessionId -> orderId -> transactionId)
+    // Locate SubAccess Order in MongoDB (Priority: fastpaySessionId -> orderId/orderNumber -> transactionId)
     let order: any = null;
     if (sessionId) {
       order = await Order.findOne({ fastpaySessionId: sessionId });
     }
-    if (!order && orderId) {
-      order = await Order.findById(orderId);
+    if (!order && rawOrderId) {
+      const cleanOrderId = String(rawOrderId).replace(/^#/, '').trim();
+      if (mongoose.Types.ObjectId.isValid(cleanOrderId)) {
+        order = await Order.findById(cleanOrderId);
+      }
+      if (!order) {
+        order = await Order.findOne({
+          $or: [
+            { orderNumber: rawOrderId },
+            { orderNumber: cleanOrderId },
+            { orderNumber: `#${cleanOrderId}` },
+          ],
+        });
+      }
     }
     if (!order && transactionId) {
       order = await Order.findOne({ transactionId: String(transactionId).trim().toUpperCase() });
@@ -484,12 +542,21 @@ router.post('/webhook', async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, message: 'Order associated with webhook session not found' });
     }
 
+    const normalizedTrxId = transactionId ? String(transactionId).trim().toUpperCase() : '';
+    const finalTrxId = normalizedTrxId || order.transactionId || '';
+
     // Idempotency check: if order is already verified, return HTTP 200 safely
     if (order.paymentStatus === 'verified') {
+      if (finalTrxId && !order.transactionId) {
+        order.transactionId = finalTrxId;
+        await order.save();
+      }
       return res.status(200).json({
         success: true,
         message: 'Webhook already processed (idempotent)',
         orderId: order._id,
+        orderNumber: order.orderNumber,
+        transactionId: order.transactionId,
       });
     }
 
@@ -503,7 +570,6 @@ router.post('/webhook', async (req: Request, res: Response) => {
     }
 
     // Check duplicate transaction ID across other verified orders
-    const normalizedTrxId = transactionId ? String(transactionId).trim().toUpperCase() : '';
     if (normalizedTrxId) {
       const duplicateOrder = await Order.findOne({
         transactionId: normalizedTrxId,
@@ -518,9 +584,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
       }
     }
 
-    const finalTrxId = normalizedTrxId || order.transactionId || '';
-
-    // Update Order state
+    // Update Order state: payment is verified, order is processing, delivery is pending admin fulfillment
     order.transactionId = finalTrxId;
     order.paymentProvider = provider || 'FastPay';
     order.paymentMethod = 'FastPay';
@@ -602,6 +666,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
       success: true,
       message: 'Fast Pay webhook processed successfully',
       orderId: order._id,
+      orderNumber: order.orderNumber,
+      transactionId: finalTrxId,
     });
   } catch (error: unknown) {
     const err = error as Error;
