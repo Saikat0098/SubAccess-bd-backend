@@ -100,13 +100,13 @@ router.post('/create-checkout', protect, async (req: AuthRequest, res: Response)
     order.paymentMethod = 'FastPay';
     await order.save();
 
-    // Authoritative hosted checkout URL
+    // Authoritative hosted checkout URL returned directly by FastPay
     const checkoutHost = (process.env.FASTPAY_CHECKOUT_URL || '').replace(/\/+$/, '');
     const checkoutUrl =
       sessionResult.checkoutUrl ||
       (checkoutHost
         ? `${checkoutHost}/checkout/session/${sessionResult.sessionId}`
-        : `http://localhost:5000/checkout/session/${sessionResult.sessionId}`);
+        : '');
 
     return res.json({
       success: true,
