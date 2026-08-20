@@ -402,6 +402,7 @@ router.get('/webhook-health', (_req: Request, res: Response) => {
 // @route POST /api/fastpay/webhook (Public server-to-server Fast Pay HMAC signed webhook endpoint)
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
+    const headerNames = Object.keys(req.headers);
     const signatureHeader = (
       req.headers['x-fastpay-signature'] ||
       req.headers['fastpay-signature'] ||
@@ -418,28 +419,42 @@ router.post('/webhook', async (req: Request, res: Response) => {
     ) as string | undefined;
 
     if (!signatureHeader) {
+      console.warn('[FastPay Webhook] Received request with missing signature header.', {
+        url: req.originalUrl || req.url,
+        method: req.method,
+        contentType: req.headers['content-type'],
+        headers: headerNames.filter((h) => !['authorization', 'cookie'].includes(h)),
+      });
       return res.status(401).json({ success: false, message: 'Missing webhook signature header' });
     }
 
-    const secrets = [
-      process.env.FASTPAY_BRAND_WEBHOOK_SECRET,
-      process.env.FASTPAY_WEBHOOK_SECRET,
-      process.env.FASTPAY_API_KEY,
-    ].filter(Boolean) as string[];
+    // Authoritative Brand Webhook Secret resolution
+    const secretSource = process.env.FASTPAY_BRAND_WEBHOOK_SECRET
+      ? 'FASTPAY_BRAND_WEBHOOK_SECRET'
+      : process.env.FASTPAY_WEBHOOK_SECRET
+      ? 'FASTPAY_WEBHOOK_SECRET'
+      : '';
 
-    if (secrets.length === 0) {
-      console.error('FASTPAY_WEBHOOK_SECRET is not configured on backend');
+    const brandWebhookSecret =
+      process.env.FASTPAY_BRAND_WEBHOOK_SECRET || process.env.FASTPAY_WEBHOOK_SECRET || '';
+
+    if (!brandWebhookSecret) {
+      console.error('[FastPay Webhook] Webhook secret is not configured in environment variables.');
       return res.status(500).json({ success: false, message: 'Server webhook configuration error' });
     }
 
     // Verify HMAC signature using raw request body Buffer
     const rawBodyBuffer = (req as any).rawBody || req.body;
-    const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, secrets);
-    if (!isValid) {
-      return res.status(401).json({ success: false, message: 'Invalid or expired webhook signature' });
-    }
+    const hasRawBody = Boolean(rawBodyBuffer);
+    const rawBodyLength = Buffer.isBuffer(rawBodyBuffer)
+      ? rawBodyBuffer.length
+      : typeof rawBodyBuffer === 'string'
+      ? Buffer.byteLength(rawBodyBuffer, 'utf8')
+      : 0;
 
-    // Safe JSON parse after HMAC verification succeeds
+    const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, [brandWebhookSecret]);
+
+    // Safe JSON parse
     let payload: any;
     try {
       if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
@@ -458,6 +473,25 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
     const { event, data, type, eventType, eventName } = payload || {};
     const effectiveEvent = String(event || type || eventType || eventName || '').toLowerCase();
+    const eventData = data || payload?.session || payload?.payment || payload;
+    const incomingBrandId = eventData?.brandId || payload?.brandId || (req.headers['x-brand-id'] as string);
+
+    // Safe Diagnostic Log (Never prints secret values)
+    console.log('[FastPay Webhook Diagnostic]', {
+      event: effectiveEvent,
+      brandId: incomingBrandId || 'unspecified',
+      configuredBrandId: process.env.FASTPAY_BRAND_ID || 'not_set',
+      contentType: req.headers['content-type'],
+      rawBodyPresent: hasRawBody,
+      rawBodyLength,
+      secretSource,
+      signaturePresent: Boolean(signatureHeader),
+      signatureVerified: isValid,
+    });
+
+    if (!isValid) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired webhook signature' });
+    }
 
     // Check if event is a payment completion/verification event
     const isPaymentVerifiedEvent =
@@ -476,8 +510,6 @@ router.post('/webhook', async (req: Request, res: Response) => {
         message: `Webhook event '${effectiveEvent}' acknowledged without state changes`,
       });
     }
-
-    const eventData = data || payload?.session || payload?.payment || payload;
     const sessionId =
       eventData?.sessionId ||
       eventData?.checkoutSessionId ||
