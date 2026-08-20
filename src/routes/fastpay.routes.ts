@@ -388,14 +388,37 @@ router.get('/sync-session/:sessionId', protect, async (req: AuthRequest, res: Re
   }
 });
 
+const WEBHOOK_HANDLER_VERSION = 'webhook-debug-2026-08-21-v2';
+
 // @route GET /api/fastpay/webhook-health (Health probe endpoint for Fast Pay webhook router)
 router.get('/webhook-health', (_req: Request, res: Response) => {
+  const brandSecretConfigured = Boolean(
+    process.env.FASTPAY_BRAND_WEBHOOK_SECRET || process.env.FASTPAY_WEBHOOK_SECRET
+  );
+  const secretSource = process.env.FASTPAY_BRAND_WEBHOOK_SECRET
+    ? 'FASTPAY_BRAND_WEBHOOK_SECRET'
+    : process.env.FASTPAY_WEBHOOK_SECRET
+    ? 'FASTPAY_WEBHOOK_SECRET'
+    : 'NONE';
+  const rawSecret =
+    process.env.FASTPAY_BRAND_WEBHOOK_SECRET || process.env.FASTPAY_WEBHOOK_SECRET || '';
+
   return res.json({
     success: true,
     service: 'SubAccess BD',
     webhook: 'FastPay',
     status: 'alive',
     endpoint: '/api/fastpay/webhook',
+    version: WEBHOOK_HANDLER_VERSION,
+    config: {
+      brandIdConfigured: Boolean(process.env.FASTPAY_BRAND_ID),
+      brandId: process.env.FASTPAY_BRAND_ID || 'not_set',
+      secretConfigured: brandSecretConfigured,
+      secretSource,
+      secretLength: rawSecret.length,
+      secretHasPrefix: rawSecret.startsWith('whsec_'),
+      apiKeyConfigured: Boolean(process.env.FASTPAY_API_KEY),
+    },
   });
 });
 
@@ -419,13 +442,19 @@ router.post('/webhook', async (req: Request, res: Response) => {
     ) as string | undefined;
 
     if (!signatureHeader) {
-      console.warn('[FastPay Webhook] Received request with missing signature header.', {
+      console.warn('[FastPay Webhook 401: MISSING_SIGNATURE]', {
+        version: WEBHOOK_HANDLER_VERSION,
         url: req.originalUrl || req.url,
         method: req.method,
         contentType: req.headers['content-type'],
         headers: headerNames.filter((h) => !['authorization', 'cookie'].includes(h)),
       });
-      return res.status(401).json({ success: false, message: 'Missing webhook signature header' });
+      return res.status(401).json({
+        success: false,
+        message: 'Missing webhook signature header',
+        version: WEBHOOK_HANDLER_VERSION,
+        code: 'MISSING_SIGNATURE',
+      });
     }
 
     // Authoritative Brand Webhook Secret resolution
@@ -452,7 +481,12 @@ router.post('/webhook', async (req: Request, res: Response) => {
       ? Buffer.byteLength(rawBodyBuffer, 'utf8')
       : 0;
 
-    const isValid = FastPay.verifyWebhookSignature(rawBodyBuffer, signatureHeader, [brandWebhookSecret]);
+    const verificationResult = FastPay.verifyWebhookSignatureWithDetails(
+      rawBodyBuffer,
+      signatureHeader,
+      [brandWebhookSecret],
+      900
+    );
 
     // Safe JSON parse
     let payload: any;
@@ -478,6 +512,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
     // Safe Diagnostic Log (Never prints secret values)
     console.log('[FastPay Webhook Diagnostic]', {
+      version: WEBHOOK_HANDLER_VERSION,
       event: effectiveEvent,
       brandId: incomingBrandId || 'unspecified',
       configuredBrandId: process.env.FASTPAY_BRAND_ID || 'not_set',
@@ -486,11 +521,28 @@ router.post('/webhook', async (req: Request, res: Response) => {
       rawBodyLength,
       secretSource,
       signaturePresent: Boolean(signatureHeader),
-      signatureVerified: isValid,
+      signatureVerified: verificationResult.isValid,
+      verificationReason: verificationResult.reason,
+      hasTimestamp: verificationResult.hasTimestamp,
+      timestampWithinTolerance: verificationResult.timestampWithinTolerance,
+      timestampRaw: verificationResult.timestampRaw,
     });
 
-    if (!isValid) {
-      return res.status(401).json({ success: false, message: 'Invalid or expired webhook signature' });
+    if (!verificationResult.isValid) {
+      console.warn(`[FastPay Webhook 401: ${verificationResult.reason}]`, {
+        version: WEBHOOK_HANDLER_VERSION,
+        reason: verificationResult.reason,
+        hasTimestamp: verificationResult.hasTimestamp,
+        timestampWithinTolerance: verificationResult.timestampWithinTolerance,
+        rawBodyLength,
+        secretSource,
+      });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired webhook signature',
+        version: WEBHOOK_HANDLER_VERSION,
+        code: verificationResult.reason,
+      });
     }
 
     // Check if event is a payment completion/verification event

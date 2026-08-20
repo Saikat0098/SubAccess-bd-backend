@@ -70,6 +70,16 @@ export interface FastPayApiError extends Error {
   code?: string;
 }
 
+export interface WebhookVerificationResult {
+  isValid: boolean;
+  reason?: string;
+  hasTimestamp: boolean;
+  timestampWithinTolerance: boolean;
+  timestampRaw?: string;
+  signaturePresent: boolean;
+  secretsCount: number;
+}
+
 export class FastPay {
   public apiKey: string;
   public merchantId: string;
@@ -231,16 +241,35 @@ export class FastPay {
     };
   }
 
-  // 4. Verify Webhook Signature (Buffer, String, Object)
-  public static verifyWebhookSignature(
+  // 4. Verify Webhook Signature with diagnostic details
+  public static verifyWebhookSignatureWithDetails(
     payload: Buffer | string | Record<string, any>,
     signatureHeader: string | undefined | null,
     secret: string | string[],
     toleranceInSeconds: number = 900
-  ): boolean {
+  ): WebhookVerificationResult {
     const rawSecrets = Array.isArray(secret) ? secret.filter(Boolean) : [secret].filter(Boolean);
-    if (rawSecrets.length === 0) return false;
-    if (!signatureHeader || typeof signatureHeader !== 'string') return false;
+    if (rawSecrets.length === 0) {
+      return {
+        isValid: false,
+        reason: 'SECRET_NOT_CONFIGURED',
+        hasTimestamp: false,
+        timestampWithinTolerance: false,
+        signaturePresent: Boolean(signatureHeader),
+        secretsCount: 0,
+      };
+    }
+
+    if (!signatureHeader || typeof signatureHeader !== 'string') {
+      return {
+        isValid: false,
+        reason: 'MISSING_SIGNATURE_HEADER',
+        hasTimestamp: false,
+        timestampWithinTolerance: false,
+        signaturePresent: false,
+        secretsCount: rawSecrets.length,
+      };
+    }
 
     // Expand secret list to handle with and without whsec_ prefixes
     const secretList: string[] = [];
@@ -258,7 +287,16 @@ export class FastPay {
     if (Buffer.isBuffer(payload)) payloadString = payload.toString('utf8');
     else if (typeof payload === 'string') payloadString = payload;
     else if (payload && typeof payload === 'object') payloadString = JSON.stringify(payload);
-    else return false;
+    else {
+      return {
+        isValid: false,
+        reason: 'INVALID_PAYLOAD_TYPE',
+        hasTimestamp: false,
+        timestampWithinTolerance: false,
+        signaturePresent: true,
+        secretsCount: secretList.length,
+      };
+    }
 
     const headerTrimmed = signatureHeader.trim();
 
@@ -302,7 +340,15 @@ export class FastPay {
     }
 
     if (!signatureHex || !/^[0-9a-fA-F]{64}$/.test(signatureHex)) {
-      return false;
+      return {
+        isValid: false,
+        reason: !signatureHex ? 'SIGNATURE_NOT_FOUND_IN_HEADER' : 'INVALID_SIGNATURE_HEX',
+        hasTimestamp: Boolean(timestampStr),
+        timestampWithinTolerance: false,
+        timestampRaw: timestampStr,
+        signaturePresent: true,
+        secretsCount: secretList.length,
+      };
     }
 
     // Parse timestamp (supporting unix seconds, unix milliseconds, and ISO-8601 date strings)
@@ -329,7 +375,6 @@ export class FastPay {
           timestampWithinTolerance = true;
         }
       } else {
-        // If timestamp cannot be parsed into a numeric epoch, allow signature check but skip strict epoch tolerance
         timestampWithinTolerance = true;
       }
     }
@@ -337,7 +382,7 @@ export class FastPay {
     const sigBuffer = Buffer.from(signatureHex.toLowerCase(), 'hex');
 
     for (const sec of secretList) {
-      // 1. Check timestamped HMAC if timestamp was present and within tolerance (or tolerance disabled)
+      // 1. Check timestamped HMAC if timestamp was present and within tolerance
       if (hasValidTimestamp && timestampWithinTolerance) {
         const candidatePayloads = [
           `${timestampStr}.${payloadString}`,
@@ -353,7 +398,15 @@ export class FastPay {
             .digest('hex');
           try {
             if (crypto.timingSafeEqual(sigBuffer, Buffer.from(expected, 'hex'))) {
-              return true;
+              return {
+                isValid: true,
+                reason: 'VERIFIED',
+                hasTimestamp: true,
+                timestampWithinTolerance: true,
+                timestampRaw: timestampStr,
+                signaturePresent: true,
+                secretsCount: secretList.length,
+              };
             }
           } catch (_) {}
         }
@@ -366,12 +419,40 @@ export class FastPay {
         .digest('hex');
       try {
         if (crypto.timingSafeEqual(sigBuffer, Buffer.from(expectedDirect, 'hex'))) {
-          return true;
+          return {
+            isValid: true,
+            reason: 'VERIFIED_DIRECT',
+            hasTimestamp: hasValidTimestamp,
+            timestampWithinTolerance,
+            timestampRaw: timestampStr,
+            signaturePresent: true,
+            secretsCount: secretList.length,
+          };
         }
       } catch (_) {}
     }
 
-    return false;
+    const failureReason = hasValidTimestamp && !timestampWithinTolerance ? 'TIMESTAMP_EXPIRED' : 'HMAC_MISMATCH';
+
+    return {
+      isValid: false,
+      reason: failureReason,
+      hasTimestamp: hasValidTimestamp,
+      timestampWithinTolerance,
+      timestampRaw: timestampStr,
+      signaturePresent: true,
+      secretsCount: secretList.length,
+    };
+  }
+
+  // 4. Verify Webhook Signature (Buffer, String, Object)
+  public static verifyWebhookSignature(
+    payload: Buffer | string | Record<string, any>,
+    signatureHeader: string | undefined | null,
+    secret: string | string[],
+    toleranceInSeconds: number = 900
+  ): boolean {
+    return FastPay.verifyWebhookSignatureWithDetails(payload, signatureHeader, secret, toleranceInSeconds).isValid;
   }
 }
 
