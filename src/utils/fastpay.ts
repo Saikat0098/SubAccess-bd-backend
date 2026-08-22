@@ -17,6 +17,7 @@ export interface CreateCheckoutParams {
   cancelUrl?: string;
   customerName?: string;
   customerPhone?: string;
+  customerEmail?: string;
   brandId?: string;
 }
 
@@ -148,6 +149,7 @@ export class FastPay {
       cancelUrl: params.cancelUrl ? params.cancelUrl.trim() : '',
       customerName: params.customerName || '',
       customerPhone: params.customerPhone || '',
+      customerEmail: params.customerEmail ? String(params.customerEmail).trim().toLowerCase() : '',
     };
     if (params.brandId || this.brandId) {
       payload.brandId = params.brandId || this.brandId;

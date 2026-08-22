@@ -91,6 +91,7 @@ router.post('/create-checkout', protect, async (req: AuthRequest, res: Response)
       currency: 'BDT',
       customerName: order.customerName || req.user.name,
       customerPhone: order.customerPhone || req.user.phone || '',
+      customerEmail: order.customerEmail || req.user.email || '',
       returnUrl,
       cancelUrl,
     });
